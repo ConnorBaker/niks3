@@ -432,6 +432,127 @@ func TestService_verifyS3Integrity(t *testing.T) {
 	}
 }
 
+// TestService_verifyS3ReuploadsNarinfoOfLostNAR commits a closure, maybe
+// loses NARs from S3, and pushes it again with verify_s3. The narinfo and its
+// listing go up again exactly when S3 lost every NAR the database records for
+// the narinfo, whichever NAR is pushed.
+func TestService_verifyS3ReuploadsNarinfoOfLostNAR(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		closure  string
+		recorded []string // NARs committed with the closure's narinfo, in order
+		lost     []string // NARs S3 loses afterwards
+		pushed   string   // NAR the verifying push carries
+		other    string   // another closure that committed the pushed NAR first
+		stale    bool     // the narinfo and listing must go up again
+		narUp    bool     // the pushed NAR must go up
+	}{
+		{
+			name: "intact", closure: "dadb44fdadb44fdadb44fdadb44f0001",
+			recorded: []string{"dadb44fdadb44fdadb44fdadb44f0001"}, pushed: "dadb44fdadb44fdadb44fdadb44f0001",
+		},
+		{
+			name: "lost, same NAR", closure: "dadb44fdadb44fdadb44fdadb44f0002",
+			recorded: []string{"dadb44fdadb44fdadb44fdadb44f0002"}, lost: []string{"dadb44fdadb44fdadb44fdadb44f0002"},
+			pushed: "dadb44fdadb44fdadb44fdadb44f0002", stale: true, narUp: true,
+		},
+		{
+			name: "lost, other NAR", closure: "dadb44fdadb44fdadb44fdadb44f0003",
+			recorded: []string{"dadb44fdadb44fdadb44fdadb44f0003"}, lost: []string{"dadb44fdadb44fdadb44fdadb44f0003"},
+			pushed: "dadb44fdadb44fdadb44fdadb44f1003", stale: true, narUp: true,
+		},
+		{
+			name: "lost, other cached NAR", closure: "dadb44fdadb44fdadb44fdadb44f0004",
+			recorded: []string{"dadb44fdadb44fdadb44fdadb44f0004"}, lost: []string{"dadb44fdadb44fdadb44fdadb44f0004"},
+			pushed: "dadb44fdadb44fdadb44fdadb44f1004", other: "dadb44fdadb44fdadb44fdadb44f2004", stale: true,
+		},
+		{
+			// A store path built again with other bytes: its narinfo still works.
+			name: "intact, other NAR", closure: "dadb44fdadb44fdadb44fdadb44f0005",
+			recorded: []string{"dadb44fdadb44fdadb44fdadb44f0005"}, pushed: "dadb44fdadb44fdadb44fdadb44f1005", narUp: true,
+		},
+		{
+			name: "intact, other cached NAR", closure: "dadb44fdadb44fdadb44fdadb44f0006",
+			recorded: []string{"dadb44fdadb44fdadb44fdadb44f0006"}, pushed: "dadb44fdadb44fdadb44fdadb44f1006",
+			other: "dadb44fdadb44fdadb44fdadb44f2006",
+		},
+		{
+			// The narinfo names one of its recorded NARs, maybe the one S3 has.
+			name: "one recorded NAR lost", closure: "dadb44fdadb44fdadb44fdadb44f0007",
+			recorded: []string{"dadb44fdadb44fdadb44fdadb44f0007", "dadb44fdadb44fdadb44fdadb44f1007"},
+			lost:     []string{"dadb44fdadb44fdadb44fdadb44f0007"}, pushed: "dadb44fdadb44fdadb44fdadb44f1007",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			service := createTestService(t)
+			defer service.Close()
+
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+
+			narinfoKey := tc.closure + ".narinfo"
+			lsKey := tc.closure + ".ls"
+			pushedNAR := narKeyFor(tc.pushed)
+
+			var committed [][2]string // closure, NAR
+			for _, nar := range tc.recorded {
+				committed = append(committed, [2]string{tc.closure, narKeyFor(nar)})
+			}
+
+			if tc.other != "" {
+				committed = append(committed, [2]string{tc.other, pushedNAR})
+			}
+
+			for _, c := range committed {
+				closure, nar := c[0], c[1]
+				resp := createPendingClosure(t, service, map[string]any{
+					"closure": closure + ".narinfo",
+					"objects": []map[string]any{
+						{"key": closure + ".narinfo", "type": "narinfo", "refs": []string{nar, closure + ".ls"}},
+						{"key": nar, "type": "nar", "refs": []string{}},
+						{"key": closure + ".ls", "type": "listing", "refs": []string{}},
+					},
+				})
+				narinfos := uploadPendingObjects(ctx, t, service, resp, closure, nar)
+				// The client uploads the narinfo it signed: here any bytes, so S3 has it.
+				if po, pending := resp.PendingObjects[closure+".narinfo"]; pending {
+					handlePresignedUpload(ctx, t, po.PresignedURL)
+				}
+
+				commitPendingClosure(t, service, resp.ID, narinfos)
+			}
+
+			for _, nar := range tc.lost {
+				ok(t, service.MinioClient.RemoveObject(ctx, service.Bucket, narKeyFor(nar), minio.RemoveObjectOptions{}))
+			}
+
+			resp := createPendingClosure(t, service, map[string]any{
+				"closure": narinfoKey,
+				"objects": []map[string]any{
+					{"key": narinfoKey, "type": "narinfo", "refs": []string{pushedNAR, lsKey}},
+					{"key": pushedNAR, "type": "nar", "refs": []string{}},
+					{"key": lsKey, "type": "listing", "refs": []string{}},
+				},
+				"verify_s3": true,
+			})
+
+			for _, key := range []string{narinfoKey, lsKey} {
+				if _, pending := resp.PendingObjects[key]; pending != tc.stale {
+					t.Errorf("%s pending: %v, want %v (pending: %v)", key, pending, tc.stale, resp.PendingObjects)
+				}
+			}
+
+			if _, pending := resp.PendingObjects[pushedNAR]; pending != tc.narUp {
+				t.Errorf("%s pending: %v, want %v", pushedNAR, pending, tc.narUp)
+			}
+		})
+	}
+}
+
 // TestCompleteMultipartUnregistered ensures complete refuses an upload that
 // was never registered, so clients cannot finalize multipart uploads outside
 // the pending-closure book-keeping.
