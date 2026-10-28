@@ -323,6 +323,48 @@ func TestClientIntegration(t *testing.T) {
 	verifyGarbageCollection(ctx, t, testService, c)
 }
 
+// A path whose NAR S3 lost is still a cached closure. A push that verifies S3
+// uploads the NAR again instead of skipping the path as cached.
+func TestClientVerifyS3IntegrityRestoresLostNAR(t *testing.T) {
+	t.Parallel()
+
+	testService := createTestServiceWithAuth(t, testAuthToken)
+	defer testService.Close()
+
+	ctx := t.Context()
+	ok(t, testService.InitializeBucket(ctx))
+
+	mux := http.NewServeMux()
+	registerTestHandlers(mux, testService)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	tempFile := filepath.Join(t.TempDir(), "lost-nar.txt")
+	ok(t, os.WriteFile(tempFile, []byte("a NAR that S3 loses"), 0o600))
+
+	nixEnv := setupIsolatedNixStore(t)
+	storePath := nixStoreAdd(t, nixEnv, tempFile)
+	ok(t, pushToServer(ctx, ts.URL, testAuthToken, []string{storePath}, nixEnv))
+
+	hash, _, _ := strings.Cut(filepath.Base(storePath), "-")
+	narKey := getNARURLFromNarinfo(ctx, t, testService, hash+".narinfo")
+	ok(t, testService.MinioClient.RemoveObject(ctx, testService.Bucket, narKey, minio.RemoveObjectOptions{}))
+
+	c, err := client.NewClient(ctx, ts.URL, testAuthToken)
+	ok(t, err)
+
+	c.NixEnv = nixEnv
+	c.VerifyS3Integrity = true
+
+	_, err = c.PushPaths(ctx, []string{storePath})
+	ok(t, err)
+
+	if _, err := testService.MinioClient.StatObject(ctx, testService.Bucket, narKey, minio.StatObjectOptions{}); err != nil {
+		t.Fatalf("NAR %s is still missing after a push that verifies S3: %v", narKey, err)
+	}
+}
+
 func TestClientMultipleUploads(t *testing.T) {
 	t.Parallel()
 
